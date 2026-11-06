@@ -1,0 +1,683 @@
+'use strict';
+// =====================================================
+//  저스트 원 (Just One) - 실시간 협동 단어 게임 서버
+// =====================================================
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const crypto = require('crypto');
+const { Server } = require('socket.io');
+const { NORMAL_WORDS, EASY_TOPICS } = require('./words');
+
+const PORT = process.env.PORT || 3000;
+const MAX_PLAYERS = 8;
+const MIN_PLAYERS = 2;
+const TOTAL_ROUNDS = 13;
+const REVIEW_SECONDS = 12;
+const RESULT_SECONDS = 10;                   // 술래 답을 보여주는 시간 (방장은 바로 넘길 수 있음)
+const EASY_CHOICES = 6;                      // 이지모드 보기 개수
+const CLUE_TIMES = [10, 15, 20, 30, 60];
+const CHAR_COUNT = 8;
+const EMOJIS = ['laugh', 'cry', 'angry', 'speechless', 'surprised'];
+const HOST_HANDOFF_MS = 30 * 1000;          // 방장이 30초 이상 끊기면 방장 넘김
+const ROOM_TTL_MS = 3 * 60 * 60 * 1000;     // 아무도 없는 방은 3시간 뒤 삭제
+
+const app = express();
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/health', (_req, res) => res.send('ok'));
+const server = http.createServer(app);
+const io = new Server(server, { pingInterval: 10000, pingTimeout: 20000 });
+
+const rooms = new Map();
+
+// ---------------- 유틸 ----------------
+const newId = () => crypto.randomBytes(8).toString('hex');
+const norm = (s) => String(s || '').replace(/\s+/g, '');
+const key = (s) => norm(s).toLowerCase(); // 대소문자 무시 비교용
+function shuffle(arr) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+function newCode() {
+  const A = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let c;
+  do { c = Array.from({ length: 4 }, () => A[Math.floor(Math.random() * A.length)]).join(''); }
+  while (rooms.has(c));
+  return c;
+}
+
+// 힌트 검사: 한글/영어 한 단어, 정답/정답 일부/합성어 금지
+function validateClue(raw, word) {
+  const t = String(raw || '').trim();
+  const lt = t.toLowerCase();
+  const w = key(word);
+  if (!t) return '힌트를 입력해 주세요.';
+  if (/\s/.test(t)) return '띄어쓰기 없이 한 단어로 적어 주세요.';
+  if (t.length > 15) return '힌트는 15글자까지 쓸 수 있어요.';
+  if (/[0-9０-９]/.test(t)) return '숫자는 쓸 수 없어요.';
+  if (/[ㄱ-ㅎㅏ-ㅣ]/.test(t)) return '자음·모음만 따로 쓸 수 없어요. (예: ㅋㅋ, ㅠㅠ)';
+  if (!/^[가-힣a-zA-Z]+$/.test(t)) return '한글이나 영어 단어만 쓸 수 있어요. (특수문자·이모티콘·한자 불가)';
+  if (lt.includes(w)) return '정답 단어가 들어간 힌트는 쓸 수 없어요.';
+  if (w.includes(lt)) return '정답 단어의 일부는 힌트로 쓸 수 없어요.';
+  for (let i = 0; i < lt.length - 1; i++) {
+    if (/[가-힣]{2}/.test(lt.substr(i, 2)) && w.includes(lt.substr(i, 2))) return '정답과 두 글자 이상 겹치는 합성어는 쓸 수 없어요.';
+  }
+  return null;
+}
+
+const getPlayer = (room, id) => room.players.find((p) => p.id === id);
+const givers = (room) => (room.r ? room.players.filter((p) => p.id !== room.r.guesserId) : []);
+function freeChar(room) {
+  for (let i = 0; i < CHAR_COUNT; i++) if (!room.players.some((p) => p.charId === i)) return i;
+  return 0;
+}
+
+// ---------------- 타이머 ----------------
+function clearTimer(room) {
+  if (room.timer) clearTimeout(room.timer);
+  room.timer = null;
+  room.endsAt = null;
+  room.phaseDuration = null;
+}
+function setTimer(room, sec, fn) {
+  clearTimer(room);
+  room.endsAt = Date.now() + sec * 1000;
+  room.phaseDuration = sec;
+  // 네트워크 지연을 감안해 0.4초 여유
+  room.timer = setTimeout(() => {
+    room.timer = null;
+    try { fn(); } catch (e) { console.error(e); }
+    broadcast(room);
+  }, sec * 1000 + 400);
+}
+
+// ---------------- 게임 진행 ----------------
+function resetGame(room) {
+  clearTimer(room);
+  room.round = 0;
+  room.history = [];
+  room.turnOrder = [];
+  room.turnPtr = 0;
+  room.used = {};
+  room.topicQueue = [];
+  room.lastTopic = null;
+  room.endedEarly = false;
+  room.r = null;
+}
+
+// 지금 술래 순서에 남아 있는 사람만 (강퇴된 사람 제외)
+function cleanOrder(room) {
+  room.turnOrder = room.turnOrder.filter((id) => getPlayer(room, id));
+  if (room.turnOrder.length) room.turnPtr = ((room.turnPtr % room.turnOrder.length) + room.turnOrder.length) % room.turnOrder.length;
+  else room.turnPtr = 0;
+}
+
+function draw(room, key, pool, n) {
+  const used = room.used[key] || (room.used[key] = new Set());
+  let avail = pool.filter((w) => !used.has(w));
+  if (avail.length < n) { used.clear(); avail = pool.slice(); }
+  const picked = shuffle(avail).slice(0, n);
+  picked.forEach((w) => used.add(w));
+  return picked;
+}
+
+function nextTopic(room) {
+  if (!room.topicQueue.length) {
+    room.topicQueue = shuffle(Object.keys(EASY_TOPICS));
+    if (room.topicQueue[0] === room.lastTopic) room.topicQueue.push(room.topicQueue.shift());
+  }
+  room.lastTopic = room.topicQueue.shift();
+  return room.lastTopic;
+}
+
+function setupRound(room) {
+  cleanOrder(room);
+  const guesserId = room.turnOrder[room.turnPtr];
+  let words;
+  let topic = null;
+  let choices = null;
+  if (room.settings.mode === 'easy') {
+    topic = nextTopic(room);
+    const pool = EASY_TOPICS[topic].words;
+    words = draw(room, 'easy:' + topic, pool, 5);
+  } else {
+    words = draw(room, 'normal', NORMAL_WORDS, 5);
+  }
+  room.r = {
+    guesserId, words, topic, choices,
+    pickedIdx: null,
+    clues: {},        // playerId -> 힌트
+    status: {},       // playerId -> 'ok' | 'dup' | 'voted'
+    votes: {},        // playerId(힌트 주인) -> Set(투표자)  [다수결 모드]
+    hostMarks: new Set(), // 방장이 제거하기로 고른 힌트 주인 id  [방장 모드]
+    reviewMode: null, // 'host' | 'vote'
+    reviewDone: new Set(),
+    guess: null,
+    guessStartAt: null, // 술래가 답을 고민하기 시작한 시각
+    reactions: new Set(), // 술래 답에 감정표현을 누른 사람 (한 번씩만)
+  };
+  room.phase = 'pick';
+  clearTimer(room);
+}
+
+function startGame(room) {
+  resetGame(room);
+  room.turnOrder = room.players.map((p) => p.id);
+  room.round = 1;
+  setupRound(room);
+}
+
+function pickWord(room, idx) {
+  const r = room.r;
+  r.pickedIdx = idx;
+  if (room.settings.mode === 'easy') {
+    // 정답 1개 + 같은 주제의 다른 단어 5개 = 보기 6개
+    const answer = r.words[idx];
+    const others = shuffle(EASY_TOPICS[r.topic].words.filter((w) => w !== answer)).slice(0, EASY_CHOICES - 1);
+    r.choices = shuffle([answer, ...others]);
+  }
+  room.phase = 'clue';
+  setTimer(room, room.settings.clueTime, () => endClue(room));
+}
+
+function endClue(room) {
+  if (room.phase !== 'clue') return;
+  const r = room.r;
+  // 1) 똑같은 힌트 자동 제거
+  const count = {};
+  for (const t of Object.values(r.clues)) count[key(t)] = (count[key(t)] || 0) + 1;
+  for (const [pid, t] of Object.entries(r.clues)) r.status[pid] = count[key(t)] > 1 ? 'dup' : 'ok';
+  const okCount = Object.values(r.status).filter((s) => s === 'ok').length;
+  // 2) 힌트 주는 사람이 2명 이상이면 비슷한 힌트 검토(투표) 단계
+  if (givers(room).length >= 2 && okCount >= 1) {
+    room.phase = 'review';
+    // 방장이 직접 검토. 단, 방장이 술래이거나 접속이 끊겼으면 다수결 투표
+    const host = getPlayer(room, room.hostId);
+    r.reviewMode = host && host.connected && host.id !== r.guesserId ? 'host' : 'vote';
+    setTimer(room, REVIEW_SECONDS, () => endReview(room));
+  } else {
+    startGuess(room);
+  }
+}
+
+function startGuess(room) {
+  clearTimer(room);
+  room.phase = 'guess';
+  room.r.guessStartAt = Date.now();
+}
+
+function voterCount(room) {
+  return Math.max(1, givers(room).filter((p) => p.connected).length);
+}
+
+function endReview(room) {
+  if (room.phase !== 'review') return;
+  const r = room.r;
+  const total = voterCount(room);
+  for (const [pid, st] of Object.entries(r.status)) {
+    if (st !== 'ok') continue;
+    if (r.reviewMode === 'host') {
+      if (r.hostMarks.has(pid)) r.status[pid] = 'voted'; // 방장이 제거
+    } else {
+      const v = r.votes[pid] ? r.votes[pid].size : 0;
+      if (v * 2 > total) r.status[pid] = 'voted'; // 과반수 찬성 → 제거
+    }
+  }
+  startGuess(room);
+}
+
+function maybeFinishReview(room) {
+  if (room.phase !== 'review' || room.r.reviewMode !== 'vote') return;
+  const active = givers(room).filter((p) => p.connected);
+  if (active.length && active.every((p) => room.r.reviewDone.has(p.id))) endReview(room);
+}
+
+// forced: 방장이 시간 초과로 오답 처리
+function submitGuess(room, text, pass, forced) {
+  const r = room.r;
+  const word = r.words[r.pickedIdx];
+  const success = !pass && !forced && key(text) === key(word);
+  r.guess = { text: pass || forced ? '' : String(text).trim(), pass: !!pass, forced: !!forced, success };
+  room.history.push({
+    round: room.round,
+    guesserId: r.guesserId,
+    guesserName: (getPlayer(room, r.guesserId) || {}).name || '?',
+    word, topic: r.topic, success, pass: !!pass, forced: !!forced, guess: r.guess.text,
+  });
+  room.phase = 'result';
+  // 답을 천천히 볼 수 있도록 10초 뒤 자동으로 다음 라운드
+  setTimer(room, RESULT_SECONDS, () => nextRound(room));
+}
+
+function nextRound(room) {
+  if (room.phase !== 'result') return;
+  if (room.round >= TOTAL_ROUNDS) return endGame(room, false);
+  room.round += 1;
+  room.turnPtr += 1;
+  setupRound(room);
+}
+
+function endGame(room, early) {
+  clearTimer(room);
+  room.phase = 'end';
+  room.endedEarly = early;
+  room.r = null;
+}
+
+// ---------------- 상태 전송 (사람마다 다르게) ----------------
+function stateFor(room, pid) {
+  const s = {
+    code: room.code,
+    hostId: room.hostId,
+    myId: pid,
+    phase: room.phase,
+    settings: room.settings,
+    players: room.players.map((p) => ({ id: p.id, name: p.name, charId: p.charId, connected: p.connected })),
+    round: room.round,
+    totalRounds: TOTAL_ROUNDS,
+    score: room.history.filter((h) => h.success).length,
+    history: room.history,
+    endedEarly: room.endedEarly,
+    serverNow: Date.now(),
+    endsAt: room.endsAt,
+    phaseDuration: room.phaseDuration,
+    game: null,
+  };
+  const r = room.r;
+  if (!r || room.phase === 'lobby' || room.phase === 'end') return s;
+
+  const isG = pid === r.guesserId;
+  const ph = room.phase;
+  const reveal = ph === 'result';
+  const hideWords = isG && !reveal;
+  const g = {
+    guesserId: r.guesserId,
+    topic: r.topic,
+    topicEmoji: r.topic ? EASY_TOPICS[r.topic].emoji : null,
+    words: hideWords ? null : r.words,
+    pickedIdx: r.pickedIdx,
+    word: hideWords || r.pickedIdx == null ? null : r.words[r.pickedIdx],
+    givers: givers(room).map((p) => p.id),
+    submitted: Object.keys(r.clues),
+    myClue: r.clues[pid] || null,
+    reviewDone: [...r.reviewDone],
+    choices: ph === 'guess' || ph === 'result' ? r.choices : null,
+    guess: reveal ? r.guess : null,
+    myReacted: r.reactions.has(pid),
+    guessStartAt: r.guessStartAt,
+    reviewMode: r.reviewMode,
+    clues: null,
+  };
+  const item = (cid) => ({
+    pid: cid,
+    text: r.clues[cid],
+    status: r.status[cid] || 'ok',
+    votes: r.votes[cid] ? r.votes[cid].size : 0,
+    myVote: !!(r.votes[cid] && r.votes[cid].has(pid)),
+    marked: r.hostMarks.has(cid),
+  });
+  if (ph === 'review' && !isG) g.clues = Object.keys(r.clues).map(item);
+  if (ph === 'guess') {
+    g.clues = isG
+      ? Object.keys(r.clues).filter((c) => r.status[c] === 'ok').map((c) => ({ pid: c, text: r.clues[c], status: 'ok' }))
+      : Object.keys(r.clues).map(item);
+  }
+  if (ph === 'result') {
+    g.clues = givers(room).map((p) => (r.clues[p.id] ? item(p.id) : { pid: p.id, text: null, status: 'none' }));
+  }
+  if (ph === 'review') g.voterCount = voterCount(room);
+  s.game = g;
+  return s;
+}
+
+function broadcast(room) {
+  for (const p of room.players) {
+    if (p.connected && p.socketId) io.to(p.socketId).emit('state', stateFor(room, p.id));
+  }
+}
+const toast = (room, msg) => io.to(room.code).emit('toast', msg);
+
+function scheduleHostHandoff(room) {
+  setTimeout(() => {
+    if (!rooms.has(room.code)) return;
+    const host = getPlayer(room, room.hostId);
+    if (host && host.connected) return;
+    const next = room.players.find((p) => p.connected);
+    if (next) {
+      room.hostId = next.id;
+      toast(room, `👑 ${next.name}님이 새 방장이 되었어요`);
+      broadcast(room);
+    }
+  }, HOST_HANDOFF_MS);
+}
+
+function removePlayer(room, pid) {
+  room.players = room.players.filter((p) => p.id !== pid);
+  if (!room.players.length) { clearTimer(room); rooms.delete(room.code); return; }
+  if (room.hostId === pid) room.hostId = (room.players.find((p) => p.connected) || room.players[0]).id;
+}
+
+// 게임 도중 강퇴: 술래 순서·힌트·투표에서 깔끔하게 빼기
+function kickInGame(room, pid) {
+  const r = room.r;
+  const wasGuesser = r && r.guesserId === pid;
+  // 술래 순서에서 빼면서 다음 술래 순서가 밀리지 않게 조정
+  const idx = room.turnOrder.indexOf(pid);
+  if (idx !== -1) {
+    const len = room.turnOrder.length;
+    const cur = ((room.turnPtr % len) + len) % len;
+    room.turnOrder.splice(idx, 1);
+    room.turnPtr = idx < cur ? cur - 1 : cur; // 술래가 강퇴되면 같은 자리 = 다음 사람
+  }
+  removePlayer(room, pid);
+  if (!rooms.has(room.code)) return;
+  if (room.phase === 'end') return;
+  if (room.players.length < MIN_PLAYERS) {
+    endGame(room, true);
+    toast(room, '🛑 인원이 부족해서 게임을 끝냈어요');
+    return;
+  }
+  if (!r) return;
+  if (wasGuesser) {
+    if (room.phase === 'result') return; // 이미 끝난 라운드 → 그대로 다음 라운드로
+    setupRound(room); // 같은 라운드 번호로 다음 사람이 술래
+    toast(room, '🎯 술래가 나가서 다음 사람이 술래를 맡아요');
+    return;
+  }
+  // 힌트 주던 사람이 나간 경우
+  if (room.phase !== 'result') {
+    delete r.clues[pid];
+    delete r.status[pid];
+    delete r.votes[pid];
+    Object.values(r.votes).forEach((set) => set.delete(pid));
+    r.hostMarks.delete(pid);
+    r.reviewDone.delete(pid);
+  }
+  if (room.phase === 'clue' && givers(room).every((p) => r.clues[p.id])) endClue(room);
+  else if (room.phase === 'review') {
+    if (!Object.values(r.status).some((st) => st === 'ok')) endReview(room);
+    else maybeFinishReview(room);
+  }
+}
+
+// ---------------- 소켓 ----------------
+io.on('connection', (socket) => {
+  const ctx = () => {
+    const room = rooms.get(socket.data.code);
+    if (!room) return {};
+    return { room, me: getPlayer(room, socket.data.pid) };
+  };
+
+  function attach(room, p) {
+    if (p.socketId && p.socketId !== socket.id) {
+      const old = io.sockets.sockets.get(p.socketId);
+      if (old) { old.data.code = null; old.emit('replaced'); old.leave(room.code); }
+    }
+    p.socketId = socket.id;
+    p.connected = true;
+    socket.data.code = room.code;
+    socket.data.pid = p.id;
+    socket.join(room.code);
+    room.lastActive = Date.now();
+  }
+
+  // 공통 핸들러: 방/플레이어 확인 + 에러 처리
+  function on(event, needRoom, fn) {
+    socket.on(event, (data, cb) => {
+      const reply = typeof cb === 'function' ? cb : () => {};
+      try {
+        if (needRoom) {
+          const { room, me } = ctx();
+          if (!room || !me) return reply({ ok: false, error: '방 정보를 찾을 수 없어요.' });
+          room.lastActive = Date.now();
+          const res = fn(data || {}, room, me);
+          if (res && res.error) return reply({ ok: false, error: res.error });
+          broadcast(room);
+          return reply({ ok: true });
+        }
+        return fn(data || {}, reply);
+      } catch (e) {
+        console.error(e);
+        reply({ ok: false, error: '오류가 발생했어요.' });
+      }
+    });
+  }
+
+  const cleanName = (n) => String(n || '').trim().slice(0, 8);
+
+  on('create', false, (d, reply) => {
+    const name = cleanName(d.name);
+    if (!name) return reply({ ok: false, error: '닉네임을 입력해 주세요.' });
+    const code = newCode();
+    const room = {
+      code, hostId: null, players: [], phase: 'lobby',
+      settings: { mode: 'normal', clueTime: 20 },
+      banned: new Set(), // 강퇴된 닉네임/아이디 (이 방에 다시 못 들어옴)
+      lastActive: Date.now(),
+    };
+    resetGame(room);
+    rooms.set(code, room);
+    const p = { id: newId(), name, charId: 0, connected: true, socketId: null };
+    room.players.push(p);
+    room.hostId = p.id;
+    attach(room, p);
+    reply({ ok: true, code, playerId: p.id });
+    broadcast(room);
+  });
+
+  on('join', false, (d, reply) => {
+    const code = String(d.code || '').trim().toUpperCase();
+    const room = rooms.get(code);
+    if (!room) return reply({ ok: false, error: '그런 방이 없어요. 코드를 확인해 주세요.' });
+    const name = cleanName(d.name);
+    if (!name) return reply({ ok: false, error: '닉네임을 입력해 주세요.' });
+
+    if (room.banned && (room.banned.has(name) || (d.playerId && room.banned.has('id:' + d.playerId)))) {
+      return reply({ ok: false, error: '방장이 내보낸 방이라 다시 들어갈 수 없어요.' });
+    }
+    let p = d.playerId ? getPlayer(room, d.playerId) : null;
+    if (!p) {
+      const same = room.players.find((x) => x.name === name);
+      if (same) {
+        // 대기실에서는 같은 닉네임 금지, 게임 중에는 같은 닉네임으로 자리 이어받기
+        if (room.phase === 'lobby' && same.connected) return reply({ ok: false, error: '이미 사용 중인 닉네임이에요.' });
+        p = same;
+      }
+    }
+    if (!p) {
+      if (room.players.length >= MAX_PLAYERS) return reply({ ok: false, error: `방이 꽉 찼어요. (최대 ${MAX_PLAYERS}명)` });
+      p = { id: newId(), name, charId: freeChar(room), connected: true, socketId: null };
+      room.players.push(p);
+      if (room.phase !== 'lobby' && room.phase !== 'end') { room.turnOrder.push(p.id); cleanOrder(room); } // 게임 중 합류
+      toast(room, `🙌 ${name}님이 들어왔어요`);
+    }
+    attach(room, p);
+    reply({ ok: true, code, playerId: p.id });
+    broadcast(room);
+  });
+
+  on('resume', false, (d, reply) => {
+    const room = rooms.get(String(d.code || '').toUpperCase());
+    const p = room && getPlayer(room, d.playerId);
+    if (!p) return reply({ ok: false });
+    attach(room, p);
+    reply({ ok: true });
+    broadcast(room);
+  });
+
+  on('pickChar', true, (d, room, me) => {
+    const id = Number(d.charId);
+    if (room.phase !== 'lobby') return { error: '대기실에서만 바꿀 수 있어요.' };
+    if (!(id >= 0 && id < CHAR_COUNT)) return { error: '잘못된 캐릭터예요.' };
+    if (room.players.some((p) => p.id !== me.id && p.charId === id)) return { error: '다른 사람이 고른 캐릭터예요.' };
+    me.charId = id;
+  });
+
+  on('settings', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 바꿀 수 있어요.' };
+    if (room.phase !== 'lobby') return { error: '게임 중에는 바꿀 수 없어요.' };
+    if (d.mode === 'normal' || d.mode === 'easy') room.settings.mode = d.mode;
+    if (CLUE_TIMES.includes(Number(d.clueTime))) room.settings.clueTime = Number(d.clueTime);
+  });
+
+  on('start', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 시작할 수 있어요.' };
+    if (room.phase !== 'lobby') return { error: '이미 게임 중이에요.' };
+    if (room.players.length < MIN_PLAYERS) return { error: `${MIN_PLAYERS}명 이상 모여야 시작할 수 있어요.` };
+    startGame(room);
+  });
+
+  on('pick', true, (d, room, me) => {
+    const i = Number(d.index);
+    if (room.phase !== 'pick' || room.r.guesserId !== me.id) return { error: '지금은 고를 수 없어요.' };
+    if (!(i >= 0 && i < 5)) return { error: '1~5 중에서 골라 주세요.' };
+    pickWord(room, i);
+  });
+
+  on('clue', true, (d, room, me) => {
+    const r = room.r;
+    if (room.phase !== 'clue' || !r || r.guesserId === me.id) return { error: '지금은 힌트를 낼 수 없어요.' };
+    if (r.clues[me.id]) return { error: '이미 힌트를 냈어요.' };
+    const err = validateClue(d.text, r.words[r.pickedIdx]);
+    if (err) return { error: err };
+    r.clues[me.id] = String(d.text).trim();
+    if (givers(room).every((p) => r.clues[p.id])) endClue(room);
+  });
+
+  on('vote', true, (d, room, me) => {
+    const r = room.r;
+    if (room.phase !== 'review' || r.guesserId === me.id) return { error: '지금은 고를 수 없어요.' };
+    if (r.status[d.target] !== 'ok') return { error: '고를 수 없는 힌트예요.' };
+    if (r.reviewMode === 'host') {
+      if (room.hostId !== me.id) return { error: '이번 검토는 방장만 고를 수 있어요.' };
+      if (r.hostMarks.has(d.target)) r.hostMarks.delete(d.target); else r.hostMarks.add(d.target);
+      return;
+    }
+    const set = r.votes[d.target] || (r.votes[d.target] = new Set());
+    if (set.has(me.id)) set.delete(me.id); else set.add(me.id);
+  });
+
+  on('reviewDone', true, (d, room, me) => {
+    const r = room.r;
+    if (room.phase !== 'review' || r.guesserId === me.id) return { error: '지금은 할 수 없어요.' };
+    if (r.reviewMode === 'host') {
+      if (room.hostId !== me.id) return { error: '방장만 검토를 끝낼 수 있어요.' };
+      return endReview(room);
+    }
+    r.reviewDone.add(me.id);
+    maybeFinishReview(room);
+  });
+
+  on('guess', true, (d, room, me) => {
+    const r = room.r;
+    if (room.phase !== 'guess' || r.guesserId !== me.id) return { error: '지금은 정답을 낼 수 없어요.' };
+    if (d.pass) return submitGuess(room, '', true);
+    const text = String(d.text || '').trim();
+    if (!text) return { error: '정답을 입력해 주세요.' };
+    if (room.settings.mode === 'easy' && r.choices && !r.choices.includes(text)) return { error: '보기 중에서 골라 주세요.' };
+    submitGuess(room, text.slice(0, 20), false);
+  });
+
+  on('react', true, (d, room, me) => {
+    const r = room.r;
+    if (!r || room.phase !== 'result' || !r.guess) return { error: '술래의 답이 나왔을 때만 누를 수 있어요.' };
+    if (!EMOJIS.includes(d.emoji)) return { error: '잘못된 이모티콘이에요.' };
+    if (r.reactions.has(me.id)) return { error: '답변마다 한 번만 누를 수 있어요.' };
+    r.reactions.add(me.id);
+    io.to(room.code).emit('reaction', { emoji: d.emoji, pid: me.id });
+  });
+
+  // ----- 방장 도구 -----
+  on('host:force', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 할 수 있어요.' };
+    if (room.phase === 'clue') endClue(room);
+    else if (room.phase === 'review') endReview(room);
+    else if (room.phase === 'result') nextRound(room);
+    else return { error: '지금은 쓸 수 없어요.' };
+  });
+
+  // 술래가 너무 오래 고민할 때 방장이 오답 처리
+  on('host:wrong', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 할 수 있어요.' };
+    if (room.phase !== 'guess' || !room.r) return { error: '술래가 답을 고민할 때만 쓸 수 있어요.' };
+    submitGuess(room, '', false, true);
+    toast(room, '⏰ 방장이 시간 초과로 오답 처리했어요');
+  });
+
+  on('host:skip', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 할 수 있어요.' };
+    if (!['pick', 'clue', 'review', 'guess'].includes(room.phase)) return { error: '지금은 쓸 수 없어요.' };
+    room.turnPtr += 1;
+    setupRound(room); // 같은 라운드 번호로 다음 사람이 술래
+    toast(room, '⏭️ 방장이 술래를 다음 사람에게 넘겼어요');
+  });
+
+  on('host:end', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 할 수 있어요.' };
+    if (room.phase === 'lobby' || room.phase === 'end') return { error: '게임 중이 아니에요.' };
+    endGame(room, true);
+    toast(room, '🛑 방장이 게임을 종료했어요');
+  });
+
+  on('restart', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 할 수 있어요.' };
+    resetGame(room);
+    room.phase = 'lobby';
+  });
+
+  // 강퇴: 대기실·게임 중 언제든 가능
+  on('kick', true, (d, room, me) => {
+    if (room.hostId !== me.id) return { error: '방장만 할 수 있어요.' };
+    const t = getPlayer(room, d.playerId);
+    if (!t || t.id === me.id) return { error: '내보낼 수 없어요.' };
+    room.banned.add(t.name);
+    room.banned.add('id:' + t.id);
+    if (t.socketId) {
+      const s = io.sockets.sockets.get(t.socketId);
+      if (s) { s.emit('kicked'); s.leave(room.code); s.data.code = null; }
+    }
+    if (room.phase === 'lobby') removePlayer(room, t.id);
+    else kickInGame(room, t.id);
+    toast(room, `👋 방장이 ${t.name}님을 내보냈어요`);
+  });
+
+  socket.on('leave', (_d, cb) => {
+    const { room, me } = ctx();
+    socket.data.code = null;
+    if (room && me) {
+      socket.leave(room.code);
+      if (room.phase === 'lobby') removePlayer(room, me.id);
+      else { me.connected = false; me.socketId = null; scheduleHostHandoff(room); maybeFinishReview(room); }
+      if (rooms.has(room.code)) broadcast(room);
+    }
+    if (typeof cb === 'function') cb({ ok: true });
+  });
+
+  socket.on('disconnect', () => {
+    const { room, me } = ctx();
+    if (!room || !me || me.socketId !== socket.id) return;
+    me.connected = false;
+    me.socketId = null;
+    room.lastActive = Date.now();
+    if (room.hostId === me.id) scheduleHostHandoff(room);
+    maybeFinishReview(room);
+    broadcast(room);
+  });
+});
+
+// 오래 비어 있는 방 정리
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of rooms) {
+    if (room.players.every((p) => !p.connected) && now - room.lastActive > ROOM_TTL_MS) {
+      clearTimer(room);
+      rooms.delete(code);
+    }
+  }
+}, 10 * 60 * 1000);
+
+server.listen(PORT, () => console.log(`🎮 저스트 원 서버 실행 중: http://localhost:${PORT}`));

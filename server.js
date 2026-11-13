@@ -21,6 +21,8 @@ const CHAR_COUNT = 8;
 const EMOJIS = ['laugh', 'cry', 'angry', 'speechless', 'surprised'];
 const HOST_HANDOFF_MS = 30 * 1000;          // 방장이 30초 이상 끊기면 방장 넘김
 const ROOM_TTL_MS = 3 * 60 * 60 * 1000;     // 아무도 없는 방은 3시간 뒤 삭제
+// 🔑 방 만들기 비밀번호 (Render 환경변수 ROOM_PASSWORD 로도 바꿀 수 있어요)
+const ROOM_PASSWORD = process.env.ROOM_PASSWORD || 'admin04';
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -67,6 +69,24 @@ function validateClue(raw, word) {
     if (/[가-힣]{2}/.test(lt.substr(i, 2)) && w.includes(lt.substr(i, 2))) return '정답과 두 글자 이상 겹치는 합성어는 쓸 수 없어요.';
   }
   return null;
+}
+
+// 두 힌트가 겹치는지 검사 (겹치면 두 힌트 모두 술래에게 안 보여요)
+//  - 완전히 똑같으면 겹침 (예: 물 / 물)
+//  - 이어지는 한글이 2글자 이상 같으면 겹침
+//      예) 야채 / 야채볶음, 사과 / 빨강사과, 빨간사과 / 사과나무
+//  - 한글 1글자만 같은 건 겹침 아님 (예: 개 / 무지개, 바다 / 바닷가)
+//  - 영어는 한쪽이 다른 쪽을 3글자 이상 포함할 때 겹침 (예: apple / pineapple)
+function cluesOverlap(a, b) {
+  const x = key(a), y = key(b);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  for (let i = 0; i < x.length - 1; i++) {
+    const two = x.substr(i, 2);
+    if (/^[가-힣]{2}$/.test(two) && y.includes(two)) return true;
+  }
+  const [s, l] = x.length <= y.length ? [x, y] : [y, x];
+  return /^[a-z]{3,}$/.test(s) && l.includes(s);
 }
 
 const getPlayer = (room, id) => room.players.find((p) => p.id === id);
@@ -187,10 +207,11 @@ function pickWord(room, idx) {
 function endClue(room) {
   if (room.phase !== 'clue') return;
   const r = room.r;
-  // 1) 똑같은 힌트 자동 제거
-  const count = {};
-  for (const t of Object.values(r.clues)) count[key(t)] = (count[key(t)] || 0) + 1;
-  for (const [pid, t] of Object.entries(r.clues)) r.status[pid] = count[key(t)] > 1 ? 'dup' : 'ok';
+  // 1) 똑같거나 같은 단어가 겹치는 힌트 자동 제거 (겹치는 힌트는 모두 제거)
+  const entries = Object.entries(r.clues);
+  for (const [pid, t] of entries) {
+    r.status[pid] = entries.some(([op, ot]) => op !== pid && cluesOverlap(t, ot)) ? 'dup' : 'ok';
+  }
   const okCount = Object.values(r.status).filter((s) => s === 'ok').length;
   // 2) 힌트 주는 사람이 2명 이상이면 비슷한 힌트 검토(투표) 단계
   if (givers(room).length >= 2 && okCount >= 1) {
@@ -361,7 +382,8 @@ function removePlayer(room, pid) {
   if (room.hostId === pid) room.hostId = (room.players.find((p) => p.connected) || room.players[0]).id;
 }
 
-// 게임 도중 강퇴: 술래 순서·힌트·투표에서 깔끔하게 빼기
+// 게임 도중 강퇴/나가기: 술래 순서·힌트·투표에서 깔끔하게 빼기
+// 돌려주는 값: 다 같이 알려줄 추가 안내 문구 (없으면 '')
 function kickInGame(room, pid) {
   const r = room.r;
   const wasGuesser = r && r.guesserId === pid;
@@ -374,19 +396,17 @@ function kickInGame(room, pid) {
     room.turnPtr = idx < cur ? cur - 1 : cur; // 술래가 강퇴되면 같은 자리 = 다음 사람
   }
   removePlayer(room, pid);
-  if (!rooms.has(room.code)) return;
-  if (room.phase === 'end') return;
+  if (!rooms.has(room.code)) return '';
+  if (room.phase === 'end') return '';
   if (room.players.length < MIN_PLAYERS) {
     endGame(room, true);
-    toast(room, '🛑 인원이 부족해서 게임을 끝냈어요');
-    return;
+    return '🛑 인원이 부족해서 게임을 끝냈어요';
   }
-  if (!r) return;
+  if (!r) return '';
   if (wasGuesser) {
-    if (room.phase === 'result') return; // 이미 끝난 라운드 → 그대로 다음 라운드로
+    if (room.phase === 'result') return ''; // 이미 끝난 라운드 → 그대로 다음 라운드로
     setupRound(room); // 같은 라운드 번호로 다음 사람이 술래
-    toast(room, '🎯 술래가 나가서 다음 사람이 술래를 맡아요');
-    return;
+    return '🎯 술래가 나가서 다음 사람이 술래를 맡아요';
   }
   // 힌트 주던 사람이 나간 경우
   if (room.phase !== 'result') {
@@ -402,6 +422,16 @@ function kickInGame(room, pid) {
     if (!Object.values(r.status).some((st) => st === 'ok')) endReview(room);
     else maybeFinishReview(room);
   }
+  return '';
+}
+
+// 사람이 빠졌을 때 남은 사람들에게 한 번에 알려주기
+function notifyRemoved(room, firstMsg, wasHost, removedId, extra) {
+  if (!rooms.has(room.code)) return;
+  const parts = [firstMsg];
+  if (wasHost && room.hostId !== removedId) parts.push(`👑 새 방장: ${getPlayer(room, room.hostId).name}`);
+  if (extra) parts.push(extra);
+  toast(room, parts.join(' · '));
 }
 
 // ---------------- 소켓 ----------------
@@ -452,6 +482,7 @@ io.on('connection', (socket) => {
   on('create', false, (d, reply) => {
     const name = cleanName(d.name);
     if (!name) return reply({ ok: false, error: '닉네임을 입력해 주세요.' });
+    if (String(d.password || '') !== ROOM_PASSWORD) return reply({ ok: false, error: '비밀번호가 틀렸어요.' });
     const code = newCode();
     const room = {
       code, hostId: null, players: [], phase: 'lobby',
@@ -640,19 +671,24 @@ io.on('connection', (socket) => {
       const s = io.sockets.sockets.get(t.socketId);
       if (s) { s.emit('kicked'); s.leave(room.code); s.data.code = null; }
     }
-    if (room.phase === 'lobby') removePlayer(room, t.id);
-    else kickInGame(room, t.id);
-    toast(room, `👋 방장이 ${t.name}님을 내보냈어요`);
+    const extra = room.phase === 'lobby' ? (removePlayer(room, t.id), '') : kickInGame(room, t.id);
+    notifyRemoved(room, `👋 방장이 ${t.name}님을 내보냈어요`, false, t.id, extra);
   });
 
   socket.on('leave', (_d, cb) => {
     const { room, me } = ctx();
     socket.data.code = null;
     if (room && me) {
+      // 스스로 나가기: 강퇴와 똑같이 방에서 빠지지만, 다시 들어오는 건 막지 않아요
       socket.leave(room.code);
-      if (room.phase === 'lobby') removePlayer(room, me.id);
-      else { me.connected = false; me.socketId = null; scheduleHostHandoff(room); maybeFinishReview(room); }
-      if (rooms.has(room.code)) broadcast(room);
+      const wasHost = room.hostId === me.id;
+      let extra = '';
+      if (room.phase === 'lobby' || room.phase === 'end') removePlayer(room, me.id);
+      else extra = kickInGame(room, me.id);
+      if (rooms.has(room.code)) {
+        notifyRemoved(room, `🚪 ${me.name}님이 나갔어요`, wasHost, me.id, extra);
+        broadcast(room);
+      }
     }
     if (typeof cb === 'function') cb({ ok: true });
   });

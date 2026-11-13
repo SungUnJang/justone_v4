@@ -627,13 +627,13 @@ function renderHome() {
       <button class="btn big pink" data-act="join">🙌 ${esc(rc)} 방에 참가하기</button>
       <input id="codeIn" type="hidden" value="${esc(rc)}">
       <button class="btn ghost" data-act="create">🏠 그냥 새 방 만들기</button>` : `
-      <button class="btn big pink" data-act="create">🏠 방 만들기</button>
+      <button class="btn big pink" data-act="create">🏠 방 만들기 🔑</button>
       <div class="divider">친구 방에 들어가기</div>
       <div class="row"><input id="codeIn" class="txt" maxlength="4" placeholder="방 코드" style="text-transform:uppercase;flex:1.4">
       <button class="btn sky" style="margin-top:0" data-act="join">참가</button></div>`}
     <div class="rules">
       🎯 술래는 번호(1~5)만 고르고, 나머지는 그 단어의 <b>힌트</b>를 한 단어씩 적어요.<br>
-      👯 <b>똑같은 힌트</b>나 <b>비슷한 힌트</b>는 술래에게 안 보여요!<br>
+      👯 <b>똑같은 힌트</b>, <b>같은 단어가 겹치는 힌트</b>(예: 야채·야채볶음, 사과·빨강사과), <b>비슷한 힌트</b>는 술래에게 안 보여요!<br>
       🏅 2~8명 · 13라운드 · 다 같이 점수를 모으는 협동 게임
     </div>
   </div>`;
@@ -689,7 +689,7 @@ function hintCard(c, opts = {}) {
   const p = P(c.pid);
   const g = S.game;
   const removedLabel = g.reviewMode === 'host' ? '🚫 방장이 제거' : '🚫 투표로 제거';
-  const label = { dup: '👯 똑같은 힌트', voted: removedLabel, none: '⏰ 시간 초과' }[c.status];
+  const label = { dup: '👯 겹치는 힌트', voted: removedLabel, none: '⏰ 시간 초과' }[c.status];
   const hostMode = g.reviewMode === 'host';
   const picked = opts.review && c.status === 'ok' && (hostMode ? c.marked : c.myVote);
   const clickable = opts.vote && c.status === 'ok';
@@ -725,7 +725,8 @@ function renderGame() {
     selChoice = null;
     app.innerHTML = `<div class="hud" id="hud"></div><div class="strip" id="strip"></div>
       ${['clue', 'review', 'result'].includes(S.phase) ? timerHTML() : ''}
-      <div class="card">${stageHTML(isG, mySub, myDone)}</div>`;
+      <div class="card">${stageHTML(isG, mySub, myDone)}</div>
+      <button class="btn ghost" data-act="leave">🚪 게임에서 나가기</button>`;
     const inp = $('#clueIn') || $('#guessIn');
     if (inp) setTimeout(() => inp.focus(), 50);
   }
@@ -774,7 +775,7 @@ function stageHTML(isG, mySub, myDone) {
         <button class="btn big pink" data-act="clue" id="clueBtn">힌트 보내기 💌</button>
         <div class="note">📌 <b>한글이나 영어로 한 단어</b>만! 숫자·특수문자·ㅋㅋ 같은 글자는 안 돼요.<br>
         📌 정답 단어나 정답 일부가 들어간 말(합성어)도 안 돼요.<br>
-        📌 다른 사람과 <b>똑같은 힌트</b>를 쓰면 둘 다 지워져요!</div><div id="dyn"></div>`;
+        📌 다른 사람과 <b>똑같은 힌트</b>나 <b>같은 단어가 들어간 힌트</b>(예: 야채·야채볶음, 사과·빨강사과)를 쓰면 둘 다 지워져요!</div><div id="dyn"></div>`;
     case 'review': {
       const hostMode = g.reviewMode === 'host';
       const host = P(S.hostId);
@@ -1024,14 +1025,45 @@ function enterRoom(act) {
   const name = ($('#nameIn').value || '').trim();
   if (!name) return toast('닉네임을 입력해 주세요');
   LS.set('jo_name', name);
-  if (act === 'create') {
-    emit('create', { name }, (res) => { if (res.ok) { saveSession(res.code, res.playerId, name); history.replaceState(null, '', '/?room=' + res.code); } });
-  } else {
+  if (act === 'create') return openCreatePw();
+  {
     const code = ($('#codeIn').value || '').trim().toUpperCase();
     if (code.length !== 4) return toast('4글자 방 코드를 입력해 주세요');
     const pid = LS.get('jo_code') === code ? LS.get('jo_pid') : null;
     emit('join', { code, name, playerId: pid }, (res) => { if (res.ok) saveSession(res.code, res.playerId, name); });
   }
+}
+// 방 만들기 비밀번호 창
+function openCreatePw() {
+  const m = $('#modal');
+  m.innerHTML = `<div class="card">
+    <h3>🔑 방 만들기</h3>
+    <div class="tiny">방을 만들려면 비밀번호를 입력해 주세요</div>
+    <input id="pwIn" class="txt" type="password" maxlength="30" placeholder="비밀번호" autocomplete="off">
+    <div class="err" id="pwErr"></div>
+    <button class="btn big pink" data-act="createConfirm" id="pwBtn">🏠 방 만들기</button>
+    <button class="btn ghost" data-act="closeModal">취소</button>
+  </div>`;
+  m.classList.add('show');
+  setTimeout(() => $('#pwIn').focus(), 50);
+}
+function createRoom() {
+  const name = ($('#nameIn') ? $('#nameIn').value : LS.get('jo_name') || '').trim();
+  const pw = ($('#pwIn').value || '').trim();
+  if (!name) { closeModal(); return toast('닉네임을 입력해 주세요'); }
+  if (!pw) { $('#pwErr').textContent = '⚠️ 비밀번호를 입력해 주세요'; return; }
+  $('#pwBtn').disabled = true;
+  socket.emit('create', { name, password: pw }, (res) => {
+    if (res && res.ok) {
+      closeModal();
+      saveSession(res.code, res.playerId, name);
+      history.replaceState(null, '', '/?room=' + res.code);
+    } else {
+      if ($('#pwBtn')) $('#pwBtn').disabled = false;
+      if ($('#pwErr')) $('#pwErr').textContent = '⚠️ ' + ((res && res.error) || '방을 만들 수 없어요');
+      Sound.sfx('lose');
+    }
+  });
 }
 function share() {
   const link = location.origin + '/?room=' + S.code;
@@ -1040,7 +1072,11 @@ function share() {
   else prompt('초대 링크를 복사하세요', link);
 }
 function leave() {
-  if (S && !['lobby', 'end'].includes(S.phase) && !confirm('게임에서 나갈까요? 같은 닉네임으로 다시 들어올 수 있어요.')) return;
+  if (S && !['lobby', 'end'].includes(S.phase)) {
+    const meG = S.game && S.game.guesserId === S.myId;
+    if (!confirm(`게임에서 나갈까요?${meG ? '\n지금 내가 술래라서 다음 사람이 술래를 맡아요.' : ''}\n방 코드로 다시 들어올 수 있어요.`)) return;
+  }
+  closeModal();
   socket.emit('leave', {}, () => {});
   clearSession();
   S = null; prevSig = '';
@@ -1056,6 +1092,7 @@ document.addEventListener('click', (e) => {
   if (a !== 'react') Sound.sfx('click');
   switch (a) {
     case 'create': case 'join': return enterRoom(a);
+    case 'createConfirm': return createRoom();
     case 'share': return share();
     case 'leave': return leave();
     case 'char': return emit('pickChar', { charId: +el.dataset.id });
@@ -1100,6 +1137,7 @@ document.addEventListener('click', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
   if (e.target.id === 'clueIn') sendClue();
+  else if (e.target.id === 'pwIn') createRoom();
   else if (e.target.id === 'guessIn') sendGuess();
   else if (e.target.id === 'nameIn' || e.target.id === 'codeIn') enterRoom(new URLSearchParams(location.search).get('room') || (e.target.id === 'codeIn') ? 'join' : 'create');
 });
